@@ -1,0 +1,195 @@
+from javax.swing import (
+    JFrame, JPanel, JButton, JLabel, JTextArea, JScrollPane, JSplitPane,
+    JFileChooser, JOptionPane, SwingUtilities, JTextField
+)
+from java.awt import BorderLayout, Dimension
+import traceback
+import os
+
+
+def read_file(path):
+    with open(path, 'r') as f:
+        return f.read()
+
+
+def write_file(path, content):
+    with open(path, 'w') as f:
+        f.write(content)
+
+
+class HL7TransformGUI(JFrame):
+    def __init__(self):
+        JFrame.__init__(self, "HL7 Process (Jython + LightHL7)")
+        self.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE)
+        self.setPreferredSize(Dimension(1100, 700))
+
+        topPanel = JPanel()
+        loadHL7Btn = JButton("Load HL7...")
+        saveHL7Btn = JButton("Save HL7...")
+        loadScriptBtn = JButton("Load Script...")
+        saveScriptBtn = JButton("Save Script...")
+        runBtn = JButton("Run process(inString)")
+        saveOutputBtn = JButton("Save Output...")
+        self.scriptPathField = JTextField(40)
+        self.scriptPathField.setEditable(False)
+
+        topPanel.add(loadHL7Btn)
+        topPanel.add(saveHL7Btn)
+        topPanel.add(loadScriptBtn)
+        topPanel.add(saveScriptBtn)
+        topPanel.add(runBtn)
+        topPanel.add(saveOutputBtn)
+        topPanel.add(JLabel("Script:"))
+        topPanel.add(self.scriptPathField)
+
+        self.beforeArea = JTextArea()
+        self.afterArea = JTextArea()
+        self.scriptArea = JTextArea()
+
+        self.beforeArea.setLineWrap(True)
+        self.afterArea.setLineWrap(True)
+        self.scriptArea.setLineWrap(True)
+
+        self.beforeArea.setWrapStyleWord(True)
+        self.afterArea.setWrapStyleWord(True)
+        self.scriptArea.setWrapStyleWord(True)
+
+        leftSplit = JSplitPane(
+            JSplitPane.HORIZONTAL_SPLIT,
+            JScrollPane(self.beforeArea),
+            JScrollPane(self.afterArea)
+        )
+        leftSplit.setResizeWeight(0.5)
+
+        rightPanel = JScrollPane(self.scriptArea)
+
+        mainSplit = JSplitPane(
+            JSplitPane.HORIZONTAL_SPLIT,
+            leftSplit,
+            rightPanel
+        )
+        mainSplit.setResizeWeight(0.6)
+
+        self.getContentPane().setLayout(BorderLayout())
+        self.getContentPane().add(topPanel, BorderLayout.NORTH)
+        self.getContentPane().add(mainSplit, BorderLayout.CENTER)
+
+        loadHL7Btn.addActionListener(self.onLoadHL7)
+        saveHL7Btn.addActionListener(self.onSaveHL7)
+        loadScriptBtn.addActionListener(self.onLoadScript)
+        saveScriptBtn.addActionListener(self.onSaveScript)
+        runBtn.addActionListener(self.onRun)
+        saveOutputBtn.addActionListener(self.onSaveOutput)
+
+        self.scriptArea.setText(self.default_script_template())
+
+        self.pack()
+        self.setLocationRelativeTo(None)
+
+    def default_script_template(self):
+        return (
+            "# Jython process script template\n"
+            "# Expected: define process(inString) -> string\n"
+            "# Optional: you may also define transform(message_text) for compatibility.\n"
+            "# If LightHL7 is on the classpath, you can import it, e.g.:\n"
+            "# from org.nule.lighthl7lib.hl7 import Hl7Record\n\n"
+            "def process(inString):\n"
+            "    # Example no-op: normalize CR/LF and append a marker\n"
+            "    msg = inString.replace('\\r', '\\n')\n"
+            "    return msg + '\\nZCX|Example|Processed'\n"
+        )
+
+    def onLoadHL7(self, event):
+        chooser = JFileChooser()
+        if chooser.showOpenDialog(self) == JFileChooser.APPROVE_OPTION:
+            try:
+                content = read_file(chooser.getSelectedFile().getAbsolutePath())
+                self.beforeArea.setText(content)
+            except Exception as e:
+                self.showError("Failed to load HL7: %s" % e)
+
+    def onSaveHL7(self, event):
+        chooser = JFileChooser()
+        if chooser.showSaveDialog(self) == JFileChooser.APPROVE_OPTION:
+            try:
+                write_file(chooser.getSelectedFile().getAbsolutePath(), self.beforeArea.getText())
+            except Exception as e:
+                self.showError("Failed to save HL7: %s" % e)
+
+    def onLoadScript(self, event):
+        chooser = JFileChooser()
+        if chooser.showOpenDialog(self) == JFileChooser.APPROVE_OPTION:
+            try:
+                path = chooser.getSelectedFile().getAbsolutePath()
+                content = read_file(path)
+                self.scriptArea.setText(content)
+                self.scriptPathField.setText(path)
+            except Exception as e:
+                self.showError("Failed to load script: %s" % e)
+
+    def onSaveScript(self, event):
+        chooser = JFileChooser()
+        if chooser.showSaveDialog(self) == JFileChooser.APPROVE_OPTION:
+            try:
+                path = chooser.getSelectedFile().getAbsolutePath()
+                write_file(path, self.scriptArea.getText())
+                self.scriptPathField.setText(path)
+            except Exception as e:
+                self.showError("Failed to save script: %s" % e)
+
+    def onSaveOutput(self, event):
+        chooser = JFileChooser()
+        if chooser.showSaveDialog(self) == JFileChooser.APPROVE_OPTION:
+            try:
+                write_file(chooser.getSelectedFile().getAbsolutePath(), self.afterArea.getText())
+            except Exception as e:
+                self.showError("Failed to save output: %s" % e)
+
+    def onRun(self, event):
+        inString = self.beforeArea.getText()
+        script = self.scriptArea.getText()
+        if not script.strip():
+            self.showError("No script provided.")
+            return
+        try:
+            ns = {'inString': inString}
+            code = compile(script, self.scriptPathField.getText() or '<inline_script>', 'exec')
+            exec(code, ns, ns)
+
+            fn = ns.get('process')
+            if fn is None or not callable(fn):
+                fn = ns.get('transform')
+                if fn is None or not callable(fn):
+                    self.showError("Script must define process(inString) or transform(message_text). Neither found.")
+                    return
+
+            result = fn(inString)
+
+            if result is None:
+                self.showError("Function returned None; expected a string.")
+                return
+
+            try:
+                basestring  # Jython 2.7 compatibility
+                is_text = isinstance(result, basestring)
+            except NameError:
+                is_text = isinstance(result, str)
+
+            if not is_text:
+                result = str(result)
+
+            self.afterArea.setText(result)
+        except Exception:
+            tb = traceback.format_exc()
+            self.showError("Error during process/transform:\n%s" % tb)
+
+    def showError(self, msg):
+        JOptionPane.showMessageDialog(self, msg, "Error", JOptionPane.ERROR_MESSAGE)
+
+
+def main():
+    SwingUtilities.invokeLater(lambda: HL7TransformGUI().setVisible(True))
+
+
+if __name__ == '__main__':
+    main()
