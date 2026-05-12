@@ -8,15 +8,20 @@
 from javax.swing import (
     JFrame, JPanel, JButton, JCheckBox, JLabel, JTextArea, JScrollPane, JSplitPane,
     JFileChooser, JOptionPane, SwingUtilities, BorderFactory, UIManager,
-    JTextField, JComponent, KeyStroke, AbstractAction
+    JTextField, JComponent, KeyStroke, AbstractAction, JDialog, ToolTipManager
 )
 from javax.swing.text import DefaultHighlighter, JTextComponent
+from javax.swing.undo import UndoManager
+from javax.swing.event import DocumentListener
 from javax.swing.plaf.basic import BasicButtonUI, BasicScrollBarUI, BasicSplitPaneUI
 from java.awt import BorderLayout, Dimension, Color, Font, GridLayout, Insets, KeyboardFocusManager
-from java.awt.event import KeyEvent, InputEvent, FocusAdapter
+from java.awt.event import KeyEvent, InputEvent, FocusAdapter, MouseMotionAdapter
+from java.util.prefs import Preferences
+from StringIO import StringIO
 import traceback
 import os
 import re
+import sys
 
 # If needed, add RSyntaxTextArea jar to sys.path at runtime (uncomment below)
 # import sys
@@ -66,7 +71,7 @@ class FlatScrollBarUI(BasicScrollBarUI):
 
     def emptyScrollButton(self):
         button = JButton()
-        size = Dimension(0, 0)
+        size = Dimension(1, 1)
         button.setPreferredSize(size)
         button.setMinimumSize(size)
         button.setMaximumSize(size)
@@ -93,6 +98,33 @@ class ShortcutAction(AbstractAction):
 
     def actionPerformed(self, event):
         self.callback()
+
+
+class ScriptChangeListener(DocumentListener):
+    def __init__(self, gui, area, button):
+        DocumentListener.__init__(self)
+        self.gui = gui
+        self.area = area
+        self.button = button
+
+    def insertUpdate(self, event):
+        self.gui.resetCompileButton(self.area, self.button)
+
+    def removeUpdate(self, event):
+        self.gui.resetCompileButton(self.area, self.button)
+
+    def changedUpdate(self, event):
+        self.gui.resetCompileButton(self.area, self.button)
+
+
+class ScriptErrorToolTipListener(MouseMotionAdapter):
+    def __init__(self, gui, area):
+        MouseMotionAdapter.__init__(self)
+        self.gui = gui
+        self.area = area
+
+    def mouseMoved(self, event):
+        self.gui.updateScriptErrorToolTip(self.area, event)
 
 
 class HL7TransformGUI(JFrame):
@@ -130,11 +162,24 @@ class HL7TransformGUI(JFrame):
         self.scriptHeaderControls = []
         self.scriptToggles = []
         self.scriptCompileButtons = []
+        self.scriptTagsButtons = []
         self.scriptRejectButtons = []
         self.scriptScrollPanes = []
+        self.scriptCompileErrorLines = {}
+        self.scriptCompileErrorHighlights = {}
         self.maxScripts = 4
         self.activeTextArea = None
+        self.undoManagers = {}
         self.searchLabels = []
+        self.preferences = Preferences.userRoot().node("HL7TransformGUI")
+        self.darkMode = self.preferences.getBoolean("darkMode", False)
+        self.consoleDialog = None
+        self.consolePanel = None
+        self.consoleTopPanel = None
+        self.consoleArea = None
+        self.consoleScrollPane = None
+        self.consoleClearBtn = None
+        self.consoleBuffer = ""
 
         # Top controls
         self.topPanel = JPanel()
@@ -157,7 +202,10 @@ class HL7TransformGUI(JFrame):
         self.themeToggle = JCheckBox("Dark mode")
         self.themeToggle.setFont(Font("Segoe UI", Font.PLAIN, 12))
         self.themeToggle.setFocusPainted(False)
+        self.themeToggle.setSelected(self.darkMode)
         self.findToggleBtn = self.toolbarButton("Find/Replace")
+        self.consoleBtn = self.toolbarButton(">_ Console")
+        self.consoleBtn.setToolTipText("Show script print output")
         self.findField = JTextField(14)
         self.replaceField = JTextField(14)
         self.findBtn = self.toolbarButton("Find")
@@ -171,6 +219,7 @@ class HL7TransformGUI(JFrame):
         self.searchLabels.append(findLabel)
         self.searchLabels.append(replaceLabel)
         self.topPanel.add(self.findToggleBtn)
+        self.topPanel.add(self.consoleBtn)
         self.findReplacePanel = JPanel()
         self.findReplacePanel.add(findLabel)
         self.findReplacePanel.add(self.findField)
@@ -240,8 +289,9 @@ class HL7TransformGUI(JFrame):
         self.runBtn.addActionListener(self.onRun)
         self.addScriptBtn.addActionListener(self.addScriptPane)
         self.removeScriptBtn.addActionListener(self.removeScriptPane)
-        self.themeToggle.addActionListener(lambda e: self.applyTheme(self.themeToggle.isSelected()))
+        self.themeToggle.addActionListener(lambda e: self.onThemeToggle())
         self.findToggleBtn.addActionListener(lambda e: self.toggleFindReplace())
+        self.consoleBtn.addActionListener(lambda e: self.showConsole())
         self.findBtn.addActionListener(lambda e: self.findNext(False))
         self.replaceBtn.addActionListener(lambda e: self.replaceCurrent())
         self.replaceAllBtn.addActionListener(lambda e: self.replaceAll())
@@ -258,7 +308,7 @@ class HL7TransformGUI(JFrame):
         # If you also want "~" treated as a delimiter, include it in the char class: r'([|\^&~])'
         self.hl7_split_regex = re.compile(r'([|\^&])')
 
-        self.applyTheme(False)
+        self.applyTheme(self.darkMode)
         self.pack()
         self.setLocationRelativeTo(None)
 
@@ -295,6 +345,16 @@ class HL7TransformGUI(JFrame):
 
     def registerTextArea(self, area):
         area.addFocusListener(TextFocusTracker(self, area))
+        undoManager = UndoManager()
+        area.getDocument().addUndoableEditListener(lambda event, manager=undoManager: manager.addEdit(event.getEdit()))
+        self.undoManagers[area] = undoManager
+        inputMap = area.getInputMap()
+        actionMap = area.getActionMap()
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_Z, InputEvent.CTRL_DOWN_MASK), "undoEdit")
+        actionMap.put("undoEdit", ShortcutAction(self.undoCurrentTextArea))
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_Y, InputEvent.CTRL_DOWN_MASK), "redoEdit")
+        actionMap.put("redoEdit", ShortcutAction(self.redoCurrentTextArea))
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_Z, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK), "redoEdit")
         if self.activeTextArea is None:
             self.activeTextArea = area
 
@@ -310,6 +370,9 @@ class HL7TransformGUI(JFrame):
         area.setCaretColor(self.accentColor)
         area.setMargin(Insets(10, 10, 10, 10))
         self.registerTextArea(area)
+        area.setToolTipText(" ")
+        ToolTipManager.sharedInstance().registerComponent(area)
+        area.addMouseMotionListener(ScriptErrorToolTipListener(self, area))
         return area
 
     def addOutputPane(self, outputNumber):
@@ -365,18 +428,22 @@ class HL7TransformGUI(JFrame):
         toggle.setFocusPainted(False)
         toggle.addActionListener(lambda e: self.onScriptToggle())
         compileBtn = self.toolbarButton("Compile")
+        tagsBtn = self.toolbarButton("Test getTags")
         rejectBtn = self.toolbarButton("Test isRejected")
 
         header = JPanel(BorderLayout())
         header.add(self.paneLabel("Jython Script %d" % scriptNumber), BorderLayout.WEST)
         headerControls = JPanel()
         headerControls.add(compileBtn)
+        headerControls.add(tagsBtn)
         headerControls.add(rejectBtn)
         headerControls.add(toggle)
         header.add(headerControls, BorderLayout.EAST)
         self.scriptHeaderControls.append(headerControls)
         compileBtn.addActionListener(lambda e, button=compileBtn: self.compileScriptForButton(button))
+        tagsBtn.addActionListener(lambda e, button=tagsBtn: self.testGetTagsForButton(button))
         rejectBtn.addActionListener(lambda e, button=rejectBtn: self.testIsRejectedForButton(button))
+        area.getDocument().addDocumentListener(ScriptChangeListener(self, area, compileBtn))
 
         scrollPane = RTextScrollPane(area)
         panel = JPanel(BorderLayout())
@@ -388,8 +455,11 @@ class HL7TransformGUI(JFrame):
         self.scriptHeaders.append(header)
         self.scriptToggles.append(toggle)
         self.scriptCompileButtons.append(compileBtn)
+        self.scriptTagsButtons.append(tagsBtn)
         self.scriptRejectButtons.append(rejectBtn)
         self.scriptScrollPanes.append(scrollPane)
+        self.scriptCompileErrorLines[area] = {}
+        self.scriptCompileErrorHighlights[area] = []
         self.panePanels.append(panel)
         self.scriptStackPanel.add(panel)
         self.addOutputPane(scriptNumber)
@@ -406,13 +476,19 @@ class HL7TransformGUI(JFrame):
             return
 
         panel = self.scriptPanes.pop()
-        self.scriptAreas.pop()
+        area = self.scriptAreas.pop()
         self.scriptHeaders.pop()
         self.scriptHeaderControls.pop()
         self.scriptToggles.pop()
         self.scriptCompileButtons.pop()
+        self.scriptTagsButtons.pop()
         self.scriptRejectButtons.pop()
         scrollPane = self.scriptScrollPanes.pop()
+        self.clearCompileErrorHighlight(area)
+        if self.scriptCompileErrorLines.has_key(area):
+            del self.scriptCompileErrorLines[area]
+        if self.scriptCompileErrorHighlights.has_key(area):
+            del self.scriptCompileErrorHighlights[area]
 
         if panel in self.panePanels:
             self.panePanels.remove(panel)
@@ -522,7 +598,7 @@ class HL7TransformGUI(JFrame):
             BorderFactory.createLineBorder(self.runBorderColor, 1),
             BorderFactory.createEmptyBorder(7, 14, 7, 14)
         ))
-        for button in (self.findToggleBtn, self.findBtn, self.replaceBtn, self.replaceAllBtn):
+        for button in (self.findToggleBtn, self.consoleBtn, self.findBtn, self.replaceBtn, self.replaceAllBtn):
             button.setBackground(self.panelColor)
             button.setForeground(self.labelColor)
             button.setBorder(BorderFactory.createCompoundBorder(
@@ -567,7 +643,7 @@ class HL7TransformGUI(JFrame):
             toggle.setForeground(self.labelColor)
             toggle.setOpaque(True)
 
-        for button in self.scriptCompileButtons + self.scriptRejectButtons:
+        for button in self.scriptCompileButtons + self.scriptTagsButtons + self.scriptRejectButtons:
             compileResult = button.getClientProperty("compileResult")
             if compileResult is True:
                 button.setBackground(Color(55, 169, 104))
@@ -587,6 +663,29 @@ class HL7TransformGUI(JFrame):
             area.setBackground(self.codeBgColor)
             area.setForeground(self.textColor)
             area.setCaretColor(self.accentColor)
+        self.refreshCompileErrorHighlights()
+
+        if self.consoleArea is not None:
+            self.consoleArea.setBackground(self.codeBgColor)
+            self.consoleArea.setForeground(self.textColor)
+            self.consoleArea.setCaretColor(self.accentColor)
+        if self.consolePanel is not None:
+            self.consolePanel.setBackground(self.bgColor)
+        if self.consoleDialog is not None:
+            self.consoleDialog.getContentPane().setBackground(self.bgColor)
+        if self.consoleTopPanel is not None:
+            self.consoleTopPanel.setBackground(self.bgColor)
+        if self.consoleScrollPane is not None:
+            self.consoleScrollPane.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, self.borderColor))
+            self.consoleScrollPane.getViewport().setBackground(self.codeBgColor)
+            self.applyScrollBarTheme(self.consoleScrollPane, scrollThumbColor, scrollTrackColor)
+        if self.consoleClearBtn is not None:
+            self.consoleClearBtn.setBackground(self.panelColor)
+            self.consoleClearBtn.setForeground(self.labelColor)
+            self.consoleClearBtn.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(self.borderColor, 1),
+                BorderFactory.createEmptyBorder(6, 10, 6, 10)
+            ))
 
         for scrollPane in self.scrollPanes:
             scrollPane.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, self.borderColor))
@@ -630,6 +729,73 @@ class HL7TransformGUI(JFrame):
         except Exception:
             pass
 
+    def onThemeToggle(self):
+        self.darkMode = self.themeToggle.isSelected()
+        self.preferences.putBoolean("darkMode", self.darkMode)
+        self.applyTheme(self.darkMode)
+
+    def showConsole(self):
+        if self.consoleDialog is not None and self.consoleDialog.isVisible():
+            self.consoleDialog.setVisible(False)
+            return
+        if self.consoleDialog is None:
+            self.consoleDialog = JDialog()
+            self.consoleDialog.setTitle("Console Output")
+            self.consoleDialog.setModal(False)
+            self.consoleDialog.setAlwaysOnTop(False)
+            self.consoleDialog.setDefaultCloseOperation(JDialog.HIDE_ON_CLOSE)
+            self.consoleDialog.setPreferredSize(Dimension(850, 360))
+            panel = JPanel(BorderLayout())
+            self.consolePanel = panel
+            self.consoleArea = JTextArea()
+            self.consoleArea.setEditable(False)
+            self.consoleArea.setLineWrap(False)
+            self.consoleArea.setFont(self.textFont)
+            self.consoleArea.setMargin(Insets(10, 10, 10, 10))
+            self.consoleArea.setText(self.consoleBuffer)
+            self.consoleScrollPane = self.cleanScrollPane(self.consoleArea)
+            self.consoleClearBtn = self.toolbarButton("Clear")
+            self.consoleClearBtn.addActionListener(lambda e: self.clearConsole())
+            self.consoleTopPanel = JPanel()
+            self.consoleTopPanel.add(self.consoleClearBtn)
+            panel.add(self.consoleTopPanel, BorderLayout.NORTH)
+            panel.add(self.consoleScrollPane, BorderLayout.CENTER)
+            self.consoleDialog.getContentPane().add(panel)
+            self.consoleDialog.pack()
+            self.consoleDialog.setLocationRelativeTo(self)
+            self.applyTheme(self.themeToggle.isSelected())
+        self.consoleDialog.setVisible(True)
+
+    def appendConsoleOutput(self, label, output):
+        if output is None or output == "":
+            return
+        header = "\n[%s]\n" % label
+        if self.consoleBuffer:
+            self.consoleBuffer += header + output
+        else:
+            self.consoleBuffer = header.lstrip() + output
+        if self.consoleArea is not None:
+            self.consoleArea.setText(self.consoleBuffer)
+            self.consoleArea.setCaretPosition(len(self.consoleArea.getText()))
+
+    def clearConsole(self):
+        self.consoleBuffer = ""
+        if self.consoleArea is not None:
+            self.consoleArea.setText("")
+
+    def startConsoleCapture(self):
+        buffer = StringIO()
+        capture = (sys.stdout, sys.stderr, buffer)
+        sys.stdout = buffer
+        sys.stderr = buffer
+        return capture
+
+    def finishConsoleCapture(self, capture, label):
+        old_stdout, old_stderr, buffer = capture
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        self.appendConsoleOutput(label, buffer.getvalue())
+
     def compileScriptForButton(self, button):
         try:
             idx = self.scriptCompileButtons.index(button)
@@ -639,7 +805,9 @@ class HL7TransformGUI(JFrame):
 
     def compileScript(self, idx):
         button = self.scriptCompileButtons[idx]
+        area = self.scriptAreas[idx]
         script = self.scriptAreas[idx].getText()
+        self.clearCompileErrorHighlight(area)
         if not script.strip():
             self.setCompileStatus(button, False, "Script is empty.")
             return False
@@ -648,7 +816,9 @@ class HL7TransformGUI(JFrame):
             self.setCompileStatus(button, True, "Jython Script %d syntax is valid." % (idx + 1))
             return True
         except Exception:
-            self.setCompileStatus(button, False, traceback.format_exc())
+            errorText = traceback.format_exc()
+            self.setCompileStatus(button, False, errorText)
+            self.highlightCompileError(area, errorText)
             return False
 
     def setCompileStatus(self, button, success, tooltip):
@@ -661,6 +831,86 @@ class HL7TransformGUI(JFrame):
             button.setForeground(Color(255, 255, 255))
         button.setToolTipText(tooltip)
 
+    def resetCompileButton(self, area, button):
+        button.putClientProperty("compileResult", None)
+        button.setBackground(self.panelColor)
+        button.setForeground(self.labelColor)
+        button.setToolTipText(None)
+        self.clearCompileErrorHighlight(area)
+
+    def compileErrorLineNumber(self, errorText):
+        matches = re.findall(r'File ".*?", line (\d+)', errorText)
+        if matches:
+            try:
+                return int(matches[-1])
+            except Exception:
+                return None
+        return None
+
+    def highlightCompileError(self, area, errorText):
+        lineNumber = self.compileErrorLineNumber(errorText)
+        if lineNumber is None:
+            return
+        lineIndex = lineNumber - 1
+        self.addCompileErrorHighlight(area, lineIndex, errorText)
+
+    def addCompileErrorHighlight(self, area, lineIndex, errorText):
+        try:
+            if self.themeToggle.isSelected():
+                color = Color(103, 50, 55)
+            else:
+                color = Color(255, 205, 205)
+            tag = area.addLineHighlight(lineIndex, color)
+            self.scriptCompileErrorHighlights[area] = [tag]
+            self.scriptCompileErrorLines[area] = {lineIndex: errorText}
+        except Exception:
+            pass
+
+    def refreshCompileErrorHighlights(self):
+        for area in self.scriptAreas:
+            errorLines = self.scriptCompileErrorLines.get(area, {})
+            if not errorLines:
+                continue
+            for tag in self.scriptCompileErrorHighlights.get(area, []):
+                try:
+                    area.removeLineHighlight(tag)
+                except Exception:
+                    pass
+            self.scriptCompileErrorHighlights[area] = []
+            for lineIndex in errorLines.keys():
+                self.addCompileErrorHighlight(area, lineIndex, errorLines[lineIndex])
+
+    def clearCompileErrorHighlight(self, area):
+        try:
+            for tag in self.scriptCompileErrorHighlights.get(area, []):
+                try:
+                    area.removeLineHighlight(tag)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.scriptCompileErrorHighlights[area] = []
+        self.scriptCompileErrorLines[area] = {}
+        area.setToolTipText(" ")
+
+    def updateScriptErrorToolTip(self, area, event):
+        errorLines = self.scriptCompileErrorLines.get(area, {})
+        if not errorLines:
+            area.setToolTipText(" ")
+            return
+        try:
+            offset = area.viewToModel(event.getPoint())
+            line = area.getLineOfOffset(offset)
+            if errorLines.has_key(line):
+                area.setToolTipText("<html><pre>%s</pre></html>" % self.escapeHtml(errorLines[line]))
+            else:
+                area.setToolTipText(" ")
+        except Exception:
+            area.setToolTipText(" ")
+
+    def escapeHtml(self, text):
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     def testIsRejectedForButton(self, button):
         try:
             idx = self.scriptRejectButtons.index(button)
@@ -668,28 +918,83 @@ class HL7TransformGUI(JFrame):
             return
         self.testIsRejected(idx)
 
+    def testGetTagsForButton(self, button):
+        try:
+            idx = self.scriptTagsButtons.index(button)
+        except ValueError:
+            return
+        self.testGetTags(idx)
+
+    def testGetTags(self, idx):
+        try:
+            stageInput = self.inputForScript(idx)
+            context = self.defaultContext()
+            ns = self.loadScriptNamespace(idx, stageInput, context)
+            tags = self.evaluateGetTags(idx, stageInput, context, ns)
+            self.showMessage("getTags Result", "tags=%s" % tags)
+        except Exception:
+            self.showError("Error during getTags test:\n%s" % traceback.format_exc())
+
     def testIsRejected(self, idx):
         try:
             stageInput = self.inputForScript(idx)
-            ns = {'inString': stageInput}
-            script = self.scriptAreas[idx].getText()
-            code = compile(script, '<inline_script_%d>' % (idx + 1), 'exec')
-            exec(code, ns, ns)
-
+            context = self.defaultContext()
+            ns = self.loadScriptNamespace(idx, stageInput, context)
             fn = ns.get('isRejected')
             if fn is None or not callable(fn):
-                self.showInfo("Jython Script %d does not define isRejected(inString, context)." % (idx + 1))
+                self.showMessage("isRejected Test", "Jython Script %d does not define isRejected(inString, context)." % (idx + 1))
                 return
 
-            context = {}
-            result = fn(stageInput, context)
+            self.evaluateGetTags(idx, stageInput, context, ns)
+            capture = self.startConsoleCapture()
+            try:
+                result = fn(stageInput, context)
+            finally:
+                self.finishConsoleCapture(capture, "Jython Script %d isRejected" % (idx + 1))
             isRejected = bool(result)
             message = "isRejected=%s" % isRejected
             if isRejected and context.get('rejectReason'):
                 message += "\nrejectReason=%s" % context.get('rejectReason')
-            self.showInfo(message)
+            self.showMessage("isRejected Test", message)
         except Exception:
             self.showError("Error during isRejected test:\n%s" % traceback.format_exc())
+
+    def defaultContext(self):
+        return {'tags': []}
+
+    def loadScriptNamespace(self, idx, inString, context=None):
+        script = self.scriptAreas[idx].getText()
+        if not script.strip():
+            raise Exception("Jython Script %d is empty." % (idx + 1))
+        if context is None:
+            context = self.defaultContext()
+        elif not context.has_key('tags'):
+            context['tags'] = []
+        ns = {'inString': inString, 'context': context}
+        codeName = self.scriptPath if idx == 0 and self.scriptPath else '<inline_script_%d>' % (idx + 1)
+        capture = self.startConsoleCapture()
+        try:
+            code = compile(script, codeName, 'exec')
+            exec(code, ns, ns)
+        finally:
+            self.finishConsoleCapture(capture, "Jython Script %d load" % (idx + 1))
+        return ns
+
+    def evaluateGetTags(self, idx, inString, context, ns):
+        if not context.has_key('tags'):
+            context['tags'] = []
+        fn = ns.get('getTags')
+        if fn is None or not callable(fn):
+            return context['tags']
+        capture = self.startConsoleCapture()
+        try:
+            tags = fn(inString, context)
+        finally:
+            self.finishConsoleCapture(capture, "Jython Script %d getTags" % (idx + 1))
+        if tags is None:
+            tags = context.get('tags', [])
+        context['tags'] = tags
+        return tags
 
     def inputForScript(self, targetIdx):
         resultText = self.beforeArea.getText()
@@ -700,22 +1005,20 @@ class HL7TransformGUI(JFrame):
         return resultText
 
     def runProcessScript(self, idx, inString):
-        script = self.scriptAreas[idx].getText()
-        if not script.strip():
-            raise Exception("Jython Script %d is enabled but empty." % (idx + 1))
-
-        ns = {'inString': inString}
-        codeName = self.scriptPath if idx == 0 and self.scriptPath else '<inline_script_%d>' % (idx + 1)
-        code = compile(script, codeName, 'exec')
-        exec(code, ns, ns)
-
+        context = self.defaultContext()
+        ns = self.loadScriptNamespace(idx, inString, context)
+        self.evaluateGetTags(idx, inString, context, ns)
         fn = ns.get('process')
         if fn is None or not callable(fn):
             fn = ns.get('transform')
-            if fn is None or not callable(fn):
-                raise Exception("Jython Script %d must define process(inString) or transform(message_text)." % (idx + 1))
+        if fn is None or not callable(fn):
+            return inString
 
-        result = fn(inString)
+        capture = self.startConsoleCapture()
+        try:
+            result = fn(inString)
+        finally:
+            self.finishConsoleCapture(capture, "Jython Script %d process" % (idx + 1))
         if result is None:
             raise Exception("Jython Script %d returned None; expected a string." % (idx + 1))
 
@@ -747,6 +1050,14 @@ class HL7TransformGUI(JFrame):
 
         inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_R, InputEvent.CTRL_DOWN_MASK), "replaceCurrent")
         actionMap.put("replaceCurrent", ShortcutAction(self.replaceCurrent))
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_Z, InputEvent.CTRL_DOWN_MASK), "undoEdit")
+        actionMap.put("undoEdit", ShortcutAction(self.undoCurrentTextArea))
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_Y, InputEvent.CTRL_DOWN_MASK), "redoEdit")
+        actionMap.put("redoEdit", ShortcutAction(self.redoCurrentTextArea))
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_Z, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK), "redoEdit")
 
     def focusFind(self):
         self.showFindReplace()
@@ -788,6 +1099,39 @@ class HL7TransformGUI(JFrame):
         if isinstance(owner, JTextComponent) and owner not in (self.findField, self.replaceField):
             self.activeTextArea = owner
         return self.activeTextArea
+
+    def currentEditableTextArea(self):
+        owner = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner()
+        if owner in (self.findField, self.replaceField):
+            return None
+        if isinstance(owner, JTextComponent):
+            self.activeTextArea = owner
+        area = self.activeTextArea
+        if area is None or not area.isEditable():
+            return None
+        return area
+
+    def undoCurrentTextArea(self):
+        area = self.currentEditableTextArea()
+        if area is None:
+            return
+        manager = self.undoManagers.get(area)
+        if manager is not None and manager.canUndo():
+            try:
+                manager.undo()
+            except Exception:
+                pass
+
+    def redoCurrentTextArea(self):
+        area = self.currentEditableTextArea()
+        if area is None:
+            return
+        manager = self.undoManagers.get(area)
+        if manager is not None and manager.canRedo():
+            try:
+                manager.redo()
+            except Exception:
+                pass
 
     def findNext(self, reverse=False):
         area = self.currentTextArea()
@@ -1157,7 +1501,10 @@ class HL7TransformGUI(JFrame):
         JOptionPane.showMessageDialog(self, msg, "Error", JOptionPane.ERROR_MESSAGE)
 
     def showInfo(self, msg):
-        JOptionPane.showMessageDialog(self, msg, "isRejected Test", JOptionPane.INFORMATION_MESSAGE)
+        self.showMessage("Info", msg)
+
+    def showMessage(self, title, msg):
+        JOptionPane.showMessageDialog(self, msg, title, JOptionPane.INFORMATION_MESSAGE)
 
 
 def main():
